@@ -1,0 +1,8 @@
+{
+  "name": "Remix: YouTube AI Creator Studio",
+  "description": "A futuristic AI-powered tool to generate YouTube scripts, prompts, and metadata from topics or images.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
