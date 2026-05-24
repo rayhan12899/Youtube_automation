@@ -11,18 +11,39 @@ import { motion, AnimatePresence } from 'motion/react';
 import {
   Mic, MicOff, Copy, Check, Settings, X, Key,
   Trash2, Sparkles, Radio, Save, AlertCircle, Eye, EyeOff,
-  WifiOff
+  ShieldAlert, RefreshCw, Volume2
 } from 'lucide-react';
 
 type Mode = 'live' | 'ai';
 type RecordingState = 'idle' | 'listening' | 'processing' | 'result' | 'error';
+type MicPermission = 'unknown' | 'checking' | 'granted' | 'denied' | 'unavailable';
 
 interface TextResult {
   bangla: string;
   english: string;
 }
 
-// ─── Pulsing ring around mic button ───────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const isSecureContext = () =>
+  window.location.protocol === 'https:' || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+
+const getMicErrorMessage = (err: any): string => {
+  const name = err?.name || '';
+  const msg = (err?.message || '').toLowerCase();
+  if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || msg.includes('permission'))
+    return 'Microphone permission denied. Click the 🔒 icon in the address bar and allow microphone access, then reload.';
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError')
+    return 'No microphone found. Please connect a microphone and try again.';
+  if (name === 'NotReadableError' || name === 'TrackStartError')
+    return 'Microphone is being used by another app. Close other apps using the mic and try again.';
+  if (name === 'SecurityError' || !isSecureContext())
+    return 'Microphone requires a secure connection (HTTPS). Please access the app via https:// or localhost.';
+  if (name === 'AbortError')
+    return 'Microphone access was interrupted. Please try again.';
+  return 'Could not access microphone: ' + (err?.message || 'Unknown error');
+};
+
+// ─── Pulsing ring ─────────────────────────────────────────────────────────────
 const PulseRing = ({ color, active }: { color: string; active: boolean }) => {
   if (!active) return null;
   return (
@@ -35,7 +56,7 @@ const PulseRing = ({ color, active }: { color: string; active: boolean }) => {
   );
 };
 
-// ─── Floating particle (shown during processing) ───────────────────────────────
+// ─── Processing particle ──────────────────────────────────────────────────────
 const Particle = ({ index }: { index: number }) => {
   const angle = (index / 8) * 360;
   return (
@@ -68,43 +89,79 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [hasServerKey, setHasServerKey] = useState(false);
   const [serverChecked, setServerChecked] = useState(false);
+  const [micPermission, setMicPermission] = useState<MicPermission>('unknown');
+  const [micError, setMicError] = useState('');
 
   const recognitionRef = useRef<any>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const banglaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Check if server has Gemini key configured
+  // ─── Boot: check server key + mic permission ───────────────────────────────
   useEffect(() => {
     fetch('/api/config')
       .then(r => r.json())
-      .then((data: { hasServerKey: boolean }) => {
-        setHasServerKey(!!data.hasServerKey);
-      })
+      .then((data: { hasServerKey: boolean }) => setHasServerKey(!!data.hasServerKey))
       .catch(() => setHasServerKey(false))
       .finally(() => setServerChecked(true));
 
     const saved = localStorage.getItem('SVW_GEMINI_API_KEY') || '';
     setApiKey(saved);
     setTempApiKey(saved);
+
+    // Check mic permission state via Permissions API if available
+    if (navigator.permissions) {
+      navigator.permissions.query({ name: 'microphone' as PermissionName })
+        .then(status => {
+          setMicPermission(status.state === 'granted' ? 'granted' :
+            status.state === 'denied' ? 'denied' : 'unknown');
+          status.onchange = () => {
+            setMicPermission(status.state === 'granted' ? 'granted' :
+              status.state === 'denied' ? 'denied' : 'unknown');
+            if (status.state === 'granted') setMicError('');
+          };
+        })
+        .catch(() => setMicPermission('unknown'));
+    }
+
+    if (!isSecureContext()) {
+      setMicPermission('unavailable');
+      setMicError('Microphone requires HTTPS. Please access this app via https:// or localhost.');
+    }
   }, []);
 
-  // Auto-scroll bangla textarea as text grows
+  // Auto-scroll bangla textarea
   useEffect(() => {
     if (banglaRef.current) {
       banglaRef.current.scrollTop = banglaRef.current.scrollHeight;
     }
   }, [banglaText, liveInterim]);
 
-  // Whether AI mode can run (server key OR user key)
   const canUseAI = hasServerKey || !!apiKey;
 
-  // ─── Live Mode ────────────────────────────────────────────────────────────────
+  // ─── Request mic permission explicitly ────────────────────────────────────
+  const requestMicPermission = async () => {
+    setMicPermission('checking');
+    setMicError('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(t => t.stop());
+      setMicPermission('granted');
+      toast.success('Microphone access granted!');
+    } catch (err: any) {
+      setMicPermission('denied');
+      const msg = getMicErrorMessage(err);
+      setMicError(msg);
+      toast.error(msg);
+    }
+  };
+
+  // ─── Live Mode ────────────────────────────────────────────────────────────
   const startLiveMode = useCallback(() => {
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      toast.error('Speech recognition is not supported. Please use Chrome or Edge.');
+      toast.error('Speech recognition requires Chrome or Edge browser.');
       return;
     }
 
@@ -116,6 +173,8 @@ export default function App() {
     recognition.onstart = () => {
       setRecordingState('listening');
       setIsRecording(true);
+      setMicPermission('granted');
+      setMicError('');
       toast.success('লাইভ মোড চালু হয়েছে');
     };
 
@@ -132,10 +191,31 @@ export default function App() {
     };
 
     recognition.onerror = (event: any) => {
-      if (event.error !== 'aborted') {
-        toast.error('Speech recognition error: ' + event.error);
-        setRecordingState('error');
+      if (event.error === 'aborted') return;
+
+      let msg = '';
+      switch (event.error) {
+        case 'not-allowed':
+        case 'service-not-allowed':
+          msg = 'Microphone permission denied. Allow microphone in browser settings and reload.';
+          setMicPermission('denied');
+          break;
+        case 'audio-capture':
+          msg = 'No microphone found. Please connect a microphone.';
+          setMicPermission('unavailable');
+          break;
+        case 'no-speech':
+          msg = 'No speech detected. Please speak closer to the microphone.';
+          break;
+        case 'network':
+          msg = 'Network error during speech recognition. Check your connection.';
+          break;
+        default:
+          msg = 'Speech recognition error: ' + event.error;
       }
+      setMicError(msg);
+      toast.error(msg);
+      setRecordingState('error');
       setIsRecording(false);
       setLiveInterim('');
     };
@@ -147,7 +227,12 @@ export default function App() {
     };
 
     recognitionRef.current = recognition;
-    recognition.start();
+    try {
+      recognition.start();
+    } catch (err: any) {
+      toast.error('Could not start speech recognition: ' + err.message);
+      setRecordingState('error');
+    }
   }, []);
 
   const stopLiveMode = useCallback(() => {
@@ -158,16 +243,19 @@ export default function App() {
     setLiveInterim('');
   }, []);
 
-  // ─── AI Mode ──────────────────────────────────────────────────────────────────
+  // ─── AI Mode ──────────────────────────────────────────────────────────────
   const startAIMode = useCallback(async () => {
     if (!canUseAI) {
-      toast.error('Please add your Gemini API key in Settings to use AI Mode.');
+      toast.error('Please add your Gemini API key in Settings.');
       setShowSettings(true);
       return;
     }
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setMicPermission('granted');
+      setMicError('');
+
       const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
         : 'audio/webm';
@@ -189,8 +277,14 @@ export default function App() {
       setRecordingState('listening');
       setIsRecording(true);
       toast.success('AI মোড চালু — কথা বলুন');
-    } catch {
-      toast.error('Microphone access denied');
+    } catch (err: any) {
+      const msg = getMicErrorMessage(err);
+      setMicError(msg);
+      setMicPermission(
+        err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError' ? 'denied' :
+        err?.name === 'NotFoundError' ? 'unavailable' : 'denied'
+      );
+      toast.error(msg);
       setRecordingState('error');
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -205,11 +299,10 @@ export default function App() {
     }
   }, []);
 
-  // ─── Process audio — server proxy first, then client-side ─────────────────────
+  // ─── Process audio ─────────────────────────────────────────────────────────
   const processAudio = async (audioBlob: Blob, mimeType: string) => {
     setRecordingState('processing');
 
-    // Convert to base64
     const arrayBuffer = await audioBlob.arrayBuffer();
     const uint8 = new Uint8Array(arrayBuffer);
     let binary = '';
@@ -220,7 +313,6 @@ export default function App() {
     const audioBase64 = btoa(binary);
 
     try {
-      // Use server-side proxy (hides API key from browser)
       const res = await fetch('/api/transcribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -241,12 +333,10 @@ export default function App() {
       setEnglishText(data.english || '');
       setRecordingState('result');
     } catch (serverErr: any) {
-      // Fallback: call Gemini directly from browser (requires clientKey)
       if (apiKey) {
         await processWithGeminiDirect(audioBase64, mimeType);
       } else {
-        console.error(serverErr);
-        toast.error('AI processing failed. ' + serverErr.message);
+        toast.error('AI processing failed: ' + serverErr.message);
         setRecordingState('error');
       }
     }
@@ -257,19 +347,13 @@ export default function App() {
       const genAI = new GoogleGenAI({ apiKey });
       const response = await genAI.models.generateContent({
         model: 'gemini-2.0-flash',
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { inlineData: { mimeType, data: audioBase64 } },
-              {
-                text: `Transcribe this audio. Return ONLY a valid JSON object:
-{"bangla": "<Bangla/Bengali script transcription>", "english": "<English translation>"}
-Return ONLY the JSON — no markdown, no extra text.`,
-              },
-            ],
-          },
-        ],
+        contents: [{
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType, data: audioBase64 } },
+            { text: `Transcribe this audio. Return ONLY valid JSON:\n{"bangla": "<Bangla script>", "english": "<English translation>"}\nNo markdown, no extra text.` },
+          ],
+        }],
       });
 
       const raw = (response.text || '').trim();
@@ -290,14 +374,19 @@ Return ONLY the JSON — no markdown, no extra text.`,
     }
   };
 
-  // ─── Controls ─────────────────────────────────────────────────────────────────
+  // ─── Controls ──────────────────────────────────────────────────────────────
   const toggleRecording = () => {
+    if (micPermission === 'denied' || micPermission === 'unavailable') {
+      requestMicPermission();
+      return;
+    }
     if (isRecording) {
       mode === 'live' ? stopLiveMode() : stopAIMode();
     } else {
       setBanglaText('');
       setEnglishText('');
       setLiveInterim('');
+      setMicError('');
       setRecordingState('idle');
       mode === 'live' ? startLiveMode() : startAIMode();
     }
@@ -317,6 +406,7 @@ Return ONLY the JSON — no markdown, no extra text.`,
     setBanglaText('');
     setEnglishText('');
     setLiveInterim('');
+    setMicError('');
     setRecordingState('idle');
   };
 
@@ -344,24 +434,28 @@ Return ONLY the JSON — no markdown, no extra text.`,
     toast.success('Settings saved!');
   };
 
-  // ─── Derived UI ───────────────────────────────────────────────────────────────
+  // ─── Derived UI ────────────────────────────────────────────────────────────
+  const micBlocked = micPermission === 'denied' || micPermission === 'unavailable';
+
   const micColor =
+    micBlocked ? '#ff3d71' :
     recordingState === 'listening' ? '#ff3d71' :
     recordingState === 'processing' ? '#ffa500' :
     recordingState === 'result' ? '#00ff88' :
     recordingState === 'error' ? '#ff3d71' : '#00d4ff';
 
   const statusText =
+    micPermission === 'checking' ? '🔍 Checking microphone…' :
+    micPermission === 'denied' ? '🚫 Microphone blocked — tap to fix' :
+    micPermission === 'unavailable' ? '🎙️ No microphone found' :
     recordingState === 'listening'
       ? (mode === 'live' ? '🎤 লাইভ শুনছে…' : '🎤 রেকর্ড হচ্ছে…')
       : recordingState === 'processing' ? '⚡ প্রসেস হচ্ছে…'
       : recordingState === 'result' ? '✅ সম্পন্ন'
-      : recordingState === 'error' ? '❌ ত্রুটি হয়েছে'
+      : recordingState === 'error' ? '❌ ত্রুটি — আবার চেষ্টা করুন'
       : (mode === 'live' ? 'কথা বলুন…' : 'AI দিয়ে রেকর্ড করুন');
 
   const hasText = !!(banglaText || englishText || liveInterim);
-
-  // Show settings button only when server key is NOT present
   const showSettingsBtn = serverChecked && !hasServerKey;
 
   return (
@@ -393,51 +487,118 @@ Return ONLY the JSON — no markdown, no extra text.`,
           </div>
         </div>
 
-        {/* Settings button — only shown when no server key */}
-        {showSettingsBtn && (
-          <button
-            onClick={() => { setTempApiKey(apiKey); setShowSettings(true); }}
-            className="w-9 h-9 flex items-center justify-center rounded-xl transition-all"
-            style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}
-            title="Settings"
-          >
-            <Settings className="w-4 h-4" style={{ color: '#99c5d0e0' }} />
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          {/* Mic status indicator */}
+          {micPermission === 'granted' && (
+            <div className="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs" style={{ background: 'rgba(0,255,136,0.08)', color: '#00ff88' }}>
+              <Volume2 className="w-3 h-3" />
+              <span>Mic OK</span>
+            </div>
+          )}
+          {micBlocked && (
+            <button
+              onClick={requestMicPermission}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs"
+              style={{ background: 'rgba(255,61,113,0.1)', color: '#ff3d71', border: '1px solid rgba(255,61,113,0.3)' }}
+            >
+              <ShieldAlert className="w-3 h-3" />
+              <span>Fix Mic</span>
+            </button>
+          )}
 
-        {/* Server key indicator */}
-        {serverChecked && hasServerKey && (
-          <div
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium"
-            style={{ background: 'rgba(0,255,136,0.1)', border: '1px solid rgba(0,255,136,0.25)', color: '#00ff88' }}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
-            Ready
-          </div>
-        )}
+          {/* Settings — only when no server key */}
+          {showSettingsBtn && (
+            <button
+              onClick={() => { setTempApiKey(apiKey); setShowSettings(true); }}
+              className="w-9 h-9 flex items-center justify-center rounded-xl transition-all"
+              style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}
+            >
+              <Settings className="w-4 h-4" style={{ color: '#99c5d0e0' }} />
+            </button>
+          )}
+
+          {/* Server key badge */}
+          {serverChecked && hasServerKey && (
+            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium"
+              style={{ background: 'rgba(0,255,136,0.1)', border: '1px solid rgba(0,255,136,0.25)', color: '#00ff88' }}>
+              <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+              Ready
+            </div>
+          )}
+        </div>
       </header>
 
       {/* ── Main ── */}
       <main className="flex-1 flex flex-col items-center px-4 py-8 gap-6 max-w-2xl mx-auto w-full">
 
+        {/* HTTPS warning */}
+        {!isSecureContext() && (
+          <div className="w-full flex items-start gap-3 p-4 rounded-2xl"
+            style={{ background: 'rgba(255,61,113,0.08)', border: '1px solid rgba(255,61,113,0.3)' }}>
+            <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" style={{ color: '#ff3d71' }} />
+            <div>
+              <p className="text-xs font-semibold mb-0.5" style={{ color: '#ff3d71' }}>HTTPS Required</p>
+              <p className="text-xs" style={{ color: '#ff7090' }}>
+                Microphone access requires HTTPS. Access this app via <strong>https://</strong> or <strong>localhost</strong>.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Mic blocked banner */}
+        {micBlocked && isSecureContext() && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="w-full rounded-2xl overflow-hidden"
+            style={{ border: '1px solid rgba(255,61,113,0.3)' }}
+          >
+            <div className="px-4 py-3 flex items-center gap-3"
+              style={{ background: 'rgba(255,61,113,0.08)' }}>
+              <ShieldAlert className="w-5 h-5 shrink-0" style={{ color: '#ff3d71' }} />
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-semibold" style={{ color: '#ff3d71' }}>
+                  {micPermission === 'unavailable' ? 'No Microphone Detected' : 'Microphone Access Blocked'}
+                </p>
+                <p className="text-xs mt-0.5 leading-relaxed" style={{ color: '#ff7090' }}>
+                  {micError || 'Allow microphone access to use voice recording.'}
+                </p>
+              </div>
+              {micPermission === 'denied' && (
+                <button
+                  onClick={requestMicPermission}
+                  className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold"
+                  style={{ background: 'rgba(255,61,113,0.2)', color: '#ff3d71', border: '1px solid rgba(255,61,113,0.4)' }}
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  Try Again
+                </button>
+              )}
+            </div>
+
+            {/* Step-by-step fix */}
+            {micPermission === 'denied' && (
+              <div className="px-4 py-3 border-t" style={{ borderColor: 'rgba(255,61,113,0.15)', background: 'rgba(0,0,0,0.2)' }}>
+                <p className="text-xs font-semibold mb-2" style={{ color: '#99c5d0e0' }}>How to fix:</p>
+                <ol className="text-xs space-y-1" style={{ color: '#556680' }}>
+                  <li>1. Click the <strong style={{ color: '#99c5d0e0' }}>🔒 lock icon</strong> in your browser address bar</li>
+                  <li>2. Find <strong style={{ color: '#99c5d0e0' }}>Microphone</strong> → set it to <strong style={{ color: '#00ff88' }}>Allow</strong></li>
+                  <li>3. Click <strong style={{ color: '#99c5d0e0' }}>Reload</strong> the page</li>
+                </ol>
+              </div>
+            )}
+          </motion.div>
+        )}
+
         {/* Mode Tabs */}
-        <div
-          className="flex w-full rounded-2xl p-1"
-          style={{ background: 'rgba(17,24,48,0.8)', border: '1px solid rgba(0,212,255,0.15)' }}
-        >
+        <div className="flex w-full rounded-2xl p-1"
+          style={{ background: 'rgba(17,24,48,0.8)', border: '1px solid rgba(0,212,255,0.15)' }}>
           {(['live', 'ai'] as Mode[]).map(m => (
-            <button
-              key={m}
-              onClick={() => switchMode(m)}
+            <button key={m} onClick={() => switchMode(m)}
               className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold transition-all duration-300"
-              style={
-                mode === m
-                  ? {
-                      background: 'linear-gradient(135deg, rgba(0,212,255,0.2), rgba(123,47,255,0.2))',
-                      color: '#00d4ff',
-                      border: '1px solid rgba(0,212,255,0.4)',
-                    }
-                  : { color: '#556680', border: '1px solid transparent' }
+              style={mode === m
+                ? { background: 'linear-gradient(135deg, rgba(0,212,255,0.2), rgba(123,47,255,0.2))', color: '#00d4ff', border: '1px solid rgba(0,212,255,0.4)' }
+                : { color: '#556680', border: '1px solid transparent' }
               }
             >
               {m === 'live' ? <Radio className="w-4 h-4" /> : <Sparkles className="w-4 h-4" />}
@@ -449,22 +610,17 @@ Return ONLY the JSON — no markdown, no extra text.`,
         {/* Recording Button */}
         <div className="flex flex-col items-center gap-4">
           <div className="relative flex items-center justify-center" style={{ width: 140, height: 140 }}>
-            {/* Outer glow ring */}
-            <motion.div
-              className="absolute rounded-full"
+            <motion.div className="absolute rounded-full"
               style={{ inset: 0, border: `1px solid ${micColor}22` }}
               animate={isRecording ? { scale: [1, 1.08, 1] } : { scale: 1 }}
               transition={{ duration: 2, repeat: Infinity }}
             />
-            {/* Pulse ring */}
             <div className="absolute" style={{ inset: 8 }}>
               <PulseRing color={micColor} active={isRecording} />
             </div>
-            {/* Particles during processing */}
             {recordingState === 'processing' &&
               Array.from({ length: 8 }).map((_, i) => <Particle key={i} index={i} />)}
 
-            {/* Mic button */}
             <motion.button
               onClick={toggleRecording}
               whileTap={{ scale: 0.93 }}
@@ -478,12 +634,13 @@ Return ONLY the JSON — no markdown, no extra text.`,
               }}
             >
               {recordingState === 'processing' ? (
-                <motion.div
-                  className="w-8 h-8 rounded-full border-2"
+                <motion.div className="w-8 h-8 rounded-full border-2"
                   style={{ borderColor: micColor, borderTopColor: 'transparent' }}
                   animate={{ rotate: 360 }}
                   transition={{ duration: 0.8, repeat: Infinity, ease: 'linear' }}
                 />
+              ) : micBlocked ? (
+                <ShieldAlert className="w-10 h-10" style={{ color: micColor }} />
               ) : isRecording ? (
                 <MicOff className="w-10 h-10" style={{ color: micColor }} />
               ) : (
@@ -492,119 +649,77 @@ Return ONLY the JSON — no markdown, no extra text.`,
             </motion.button>
           </div>
 
-          {/* Status text */}
-          <motion.p
-            key={statusText}
-            initial={{ opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="text-sm font-medium"
-            style={{ color: micColor, fontFamily: 'Noto Sans Bengali, Inter, sans-serif' }}
-          >
+          <motion.p key={statusText} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}
+            className="text-sm font-medium text-center"
+            style={{ color: micColor, fontFamily: 'Noto Sans Bengali, Inter, sans-serif' }}>
             {statusText}
           </motion.p>
 
-          {/* Mode hint */}
-          <p className="text-xs text-center px-6" style={{ color: '#556680', fontFamily: 'Noto Sans Bengali, Inter, sans-serif', lineHeight: '1.6' }}>
-            {mode === 'live'
-              ? 'মাইক্রোফোন বাটনে চাপ দিন → বাংলায় কথা বলুন → আবার চাপ দিয়ে বন্ধ করুন'
-              : 'বাটনে চাপ দিন → কথা বলুন → আবার চাপ দিন → AI প্রসেস করবে'}
+          <p className="text-xs text-center px-6"
+            style={{ color: '#556680', fontFamily: 'Noto Sans Bengali, Inter, sans-serif', lineHeight: '1.6' }}>
+            {micBlocked
+              ? 'Tap the button above to request microphone access'
+              : mode === 'live'
+                ? 'মাইক্রোফোন বাটনে চাপ দিন → বাংলায় কথা বলুন → আবার চাপ দিয়ে বন্ধ করুন'
+                : 'বাটনে চাপ দিন → কথা বলুন → আবার চাপ দিন → AI প্রসেস করবে'}
           </p>
         </div>
 
         {/* Results */}
         <AnimatePresence>
           {(hasText || recordingState === 'processing') && (
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              className="w-full flex flex-col gap-4"
-            >
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }}
+              className="w-full flex flex-col gap-4">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-medium" style={{ color: '#99c5d0e0', fontFamily: 'Noto Sans Bengali, Inter, sans-serif' }}>ফলাফল</span>
                 {hasText && (
-                  <button
-                    onClick={clearAll}
-                    className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs"
-                    style={{ background: 'rgba(255,61,113,0.1)', color: '#ff3d71', border: '1px solid rgba(255,61,113,0.2)' }}
-                  >
-                    <Trash2 className="w-3 h-3" />
-                    মুছুন
+                  <button onClick={clearAll} className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs"
+                    style={{ background: 'rgba(255,61,113,0.1)', color: '#ff3d71', border: '1px solid rgba(255,61,113,0.2)' }}>
+                    <Trash2 className="w-3 h-3" />মুছুন
                   </button>
                 )}
               </div>
 
-              {/* Bangla text box */}
+              {/* Bangla */}
               <div className="rounded-2xl overflow-hidden" style={{ background: '#111830', border: '1px solid rgba(0,212,255,0.15)' }}>
-                <div
-                  className="flex items-center justify-between px-4 py-2.5 border-b"
-                  style={{ borderColor: 'rgba(0,212,255,0.1)', background: 'rgba(0,212,255,0.05)' }}
-                >
+                <div className="flex items-center justify-between px-4 py-2.5 border-b"
+                  style={{ borderColor: 'rgba(0,212,255,0.1)', background: 'rgba(0,212,255,0.05)' }}>
                   <span className="text-xs font-semibold" style={{ color: '#00d4ff', fontFamily: 'Noto Sans Bengali, Inter, sans-serif' }}>বাংলা</span>
-                  <button
-                    onClick={copyBangla}
-                    disabled={!(banglaText || liveInterim).trim()}
+                  <button onClick={copyBangla} disabled={!(banglaText || liveInterim).trim()}
                     className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs disabled:opacity-30"
-                    style={
-                      copiedBangla
-                        ? { background: 'rgba(0,255,136,0.15)', color: '#00ff88' }
-                        : { background: 'rgba(0,212,255,0.1)', color: '#00d4ff' }
-                    }
-                  >
+                    style={copiedBangla
+                      ? { background: 'rgba(0,255,136,0.15)', color: '#00ff88' }
+                      : { background: 'rgba(0,212,255,0.1)', color: '#00d4ff' }}>
                     {copiedBangla ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
                     {copiedBangla ? '✅ কপি হয়েছে!' : 'কপি বাংলা'}
                   </button>
                 </div>
-                <textarea
-                  ref={banglaRef}
-                  readOnly
-                  value={
-                    recordingState === 'processing' && !banglaText
-                      ? '⚡ প্রসেস হচ্ছে…'
-                      : banglaText + liveInterim
-                  }
+                <textarea ref={banglaRef} readOnly rows={5}
+                  value={recordingState === 'processing' && !banglaText ? '⚡ প্রসেস হচ্ছে…' : banglaText + liveInterim}
                   placeholder="বাংলা টেক্সট এখানে দেখাবে…"
-                  rows={5}
                   className="w-full bg-transparent resize-none outline-none px-4 py-3 text-sm"
-                  style={{
-                    color: !banglaText && liveInterim ? '#99c5d0e0' : '#ffffff',
-                    fontFamily: 'Noto Sans Bengali, Inter, sans-serif',
-                    lineHeight: '1.8',
-                  }}
+                  style={{ color: !banglaText && liveInterim ? '#99c5d0e0' : '#ffffff', fontFamily: 'Noto Sans Bengali, Inter, sans-serif', lineHeight: '1.8' }}
                 />
               </div>
 
-              {/* English text box — AI mode only */}
+              {/* English */}
               {(mode === 'ai' || englishText) && (
                 <div className="rounded-2xl overflow-hidden" style={{ background: '#111830', border: '1px solid rgba(123,47,255,0.2)' }}>
-                  <div
-                    className="flex items-center justify-between px-4 py-2.5 border-b"
-                    style={{ borderColor: 'rgba(123,47,255,0.15)', background: 'rgba(123,47,255,0.05)' }}
-                  >
+                  <div className="flex items-center justify-between px-4 py-2.5 border-b"
+                    style={{ borderColor: 'rgba(123,47,255,0.15)', background: 'rgba(123,47,255,0.05)' }}>
                     <span className="text-xs font-semibold" style={{ color: '#b69df8' }}>English</span>
-                    <button
-                      onClick={copyEnglish}
-                      disabled={!englishText.trim()}
+                    <button onClick={copyEnglish} disabled={!englishText.trim()}
                       className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs disabled:opacity-30"
-                      style={
-                        copiedEnglish
-                          ? { background: 'rgba(0,255,136,0.15)', color: '#00ff88' }
-                          : { background: 'rgba(123,47,255,0.1)', color: '#b69df8' }
-                      }
-                    >
+                      style={copiedEnglish
+                        ? { background: 'rgba(0,255,136,0.15)', color: '#00ff88' }
+                        : { background: 'rgba(123,47,255,0.1)', color: '#b69df8' }}>
                       {copiedEnglish ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
                       {copiedEnglish ? '✅ Copied!' : 'Copy English'}
                     </button>
                   </div>
-                  <textarea
-                    readOnly
-                    value={
-                      recordingState === 'processing' && !englishText
-                        ? 'Processing…'
-                        : englishText
-                    }
+                  <textarea readOnly rows={4}
+                    value={recordingState === 'processing' && !englishText ? 'Processing…' : englishText}
                     placeholder="English text will appear here…"
-                    rows={4}
                     className="w-full bg-transparent resize-none outline-none px-4 py-3 text-sm"
                     style={{ color: '#ffffff', lineHeight: '1.7' }}
                   />
@@ -614,72 +729,56 @@ Return ONLY the JSON — no markdown, no extra text.`,
           )}
         </AnimatePresence>
 
-        {/* No API key warning — only in AI mode, no server key, no client key */}
+        {/* No API key warning */}
         {mode === 'ai' && serverChecked && !canUseAI && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
             className="w-full flex items-start gap-3 p-4 rounded-2xl"
-            style={{ background: 'rgba(255,165,0,0.08)', border: '1px solid rgba(255,165,0,0.25)' }}
-          >
+            style={{ background: 'rgba(255,165,0,0.08)', border: '1px solid rgba(255,165,0,0.25)' }}>
             <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" style={{ color: '#ffa500' }} />
             <p className="text-xs" style={{ color: '#ffa500', fontFamily: 'Noto Sans Bengali, Inter, sans-serif' }}>
               AI মোড ব্যবহার করতে Settings-এ Gemini API Key দিন।{' '}
-              <button
-                onClick={() => { setTempApiKey(apiKey); setShowSettings(true); }}
-                className="underline"
-              >
+              <button onClick={() => { setTempApiKey(apiKey); setShowSettings(true); }} className="underline">
                 Settings খুলুন →
               </button>
             </p>
           </motion.div>
         )}
 
-        {/* Footer */}
         <p className="text-xs text-center pb-4" style={{ color: '#1e2d45' }}>
           Smart Voice Writer v1.4 · Powered by Gemini AI
         </p>
       </main>
 
-      {/* ── Settings Modal (API key) ── */}
+      {/* ── Settings Modal ── */}
       <AnimatePresence>
         {showSettings && (
           <>
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               className="fixed inset-0 z-40"
               style={{ background: 'rgba(8,12,24,0.85)', backdropFilter: 'blur(8px)' }}
               onClick={() => setShowSettings(false)}
             />
             <motion.div
-              initial={{ opacity: 0, y: 60 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 60 }}
+              initial={{ opacity: 0, y: 60 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 60 }}
               transition={{ type: 'spring', damping: 22, stiffness: 280 }}
               className="fixed bottom-0 left-0 right-0 z-50 rounded-t-3xl p-6 pb-10 max-w-lg mx-auto"
               style={{ background: '#0d1226', border: '1px solid rgba(0,212,255,0.2)', borderBottom: 'none' }}
             >
               <div className="w-10 h-1 rounded-full mx-auto mb-6" style={{ background: 'rgba(255,255,255,0.15)' }} />
-
               <div className="flex items-center justify-between mb-6">
                 <div className="flex items-center gap-2">
                   <Settings className="w-5 h-5" style={{ color: '#00d4ff' }} />
                   <h2 className="font-bold text-base" style={{ color: '#ffffff' }}>Settings</h2>
                 </div>
-                <button
-                  onClick={() => setShowSettings(false)}
+                <button onClick={() => setShowSettings(false)}
                   className="w-8 h-8 flex items-center justify-center rounded-lg"
-                  style={{ background: 'rgba(255,255,255,0.06)' }}
-                >
+                  style={{ background: 'rgba(255,255,255,0.06)' }}>
                   <X className="w-4 h-4" style={{ color: '#99c5d0e0' }} />
                 </button>
               </div>
 
               <label className="flex items-center gap-2 text-xs font-semibold mb-2" style={{ color: '#00d4ff' }}>
-                <Key className="w-3.5 h-3.5" />
-                Gemini API Key
+                <Key className="w-3.5 h-3.5" />Gemini API Key
               </label>
               <div className="relative mb-2">
                 <input
@@ -688,18 +787,11 @@ Return ONLY the JSON — no markdown, no extra text.`,
                   onChange={e => setTempApiKey(e.target.value)}
                   placeholder="AIzaSy…"
                   className="w-full px-4 py-3 pr-10 rounded-xl text-sm outline-none"
-                  style={{
-                    background: 'rgba(255,255,255,0.04)',
-                    border: '1px solid rgba(0,212,255,0.25)',
-                    color: '#ffffff',
-                    fontFamily: 'monospace',
-                  }}
+                  style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(0,212,255,0.25)', color: '#ffffff', fontFamily: 'monospace' }}
                 />
-                <button
-                  onClick={() => setShowApiKey(v => !v)}
+                <button onClick={() => setShowApiKey(v => !v)}
                   className="absolute right-3 top-1/2 -translate-y-1/2"
-                  style={{ color: '#556680' }}
-                >
+                  style={{ color: '#556680' }}>
                   {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
               </div>
@@ -710,17 +802,10 @@ Return ONLY the JSON — no markdown, no extra text.`,
                 </a>
               </p>
 
-              <button
-                onClick={saveSettings}
+              <button onClick={saveSettings}
                 className="w-full flex items-center justify-center gap-2 py-3 rounded-xl font-semibold text-sm"
-                style={{
-                  background: 'linear-gradient(135deg, rgba(0,212,255,0.2), rgba(123,47,255,0.2))',
-                  border: '1px solid rgba(0,212,255,0.4)',
-                  color: '#00d4ff',
-                }}
-              >
-                <Save className="w-4 h-4" />
-                Save Settings
+                style={{ background: 'linear-gradient(135deg, rgba(0,212,255,0.2), rgba(123,47,255,0.2))', border: '1px solid rgba(0,212,255,0.4)', color: '#00d4ff' }}>
+                <Save className="w-4 h-4" />Save Settings
               </button>
             </motion.div>
           </>
