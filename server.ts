@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
@@ -9,9 +10,11 @@ async function startServer() {
 
   app.use(express.json({ limit: "50mb" }));
 
-  // ── Config endpoint ── tells the client whether a server key is available
+  // ── Config endpoint ── tells the client whether a real server key is set
   app.get("/api/config", (_req, res) => {
-    res.json({ hasServerKey: !!process.env.GEMINI_API_KEY });
+    const key = process.env.GEMINI_API_KEY || "";
+    const hasServerKey = key.startsWith("AIza") && key.length > 20;
+    res.json({ hasServerKey });
   });
 
   // ── Server-side Gemini transcription proxy ────────────────────────────────
