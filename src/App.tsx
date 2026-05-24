@@ -1,7 +1,7 @@
 /**
  * Smart Voice Writer - Web App
  * AI-powered voice writer using Gemini API
- * Converts speech to Bangla + English text
+ * Works without user registration — server key used when available
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -10,7 +10,8 @@ import { Toaster, toast } from 'sonner';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Mic, MicOff, Copy, Check, Settings, X, Key,
-  Trash2, Sparkles, Radio, Save, AlertCircle, Eye, EyeOff
+  Trash2, Sparkles, Radio, Save, AlertCircle, Eye, EyeOff,
+  WifiOff
 } from 'lucide-react';
 
 type Mode = 'live' | 'ai';
@@ -65,13 +66,24 @@ export default function App() {
   const [copiedBangla, setCopiedBangla] = useState(false);
   const [copiedEnglish, setCopiedEnglish] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
+  const [hasServerKey, setHasServerKey] = useState(false);
+  const [serverChecked, setServerChecked] = useState(false);
 
   const recognitionRef = useRef<any>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const banglaRef = useRef<HTMLTextAreaElement>(null);
 
+  // Check if server has Gemini key configured
   useEffect(() => {
+    fetch('/api/config')
+      .then(r => r.json())
+      .then((data: { hasServerKey: boolean }) => {
+        setHasServerKey(!!data.hasServerKey);
+      })
+      .catch(() => setHasServerKey(false))
+      .finally(() => setServerChecked(true));
+
     const saved = localStorage.getItem('SVW_GEMINI_API_KEY') || '';
     setApiKey(saved);
     setTempApiKey(saved);
@@ -84,12 +96,15 @@ export default function App() {
     }
   }, [banglaText, liveInterim]);
 
+  // Whether AI mode can run (server key OR user key)
+  const canUseAI = hasServerKey || !!apiKey;
+
   // ─── Live Mode ────────────────────────────────────────────────────────────────
   const startLiveMode = useCallback(() => {
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      toast.error('Speech recognition is not supported. Please use Chrome.');
+      toast.error('Speech recognition is not supported. Please use Chrome or Edge.');
       return;
     }
 
@@ -145,8 +160,8 @@ export default function App() {
 
   // ─── AI Mode ──────────────────────────────────────────────────────────────────
   const startAIMode = useCallback(async () => {
-    if (!apiKey) {
-      toast.error('Please set your Gemini API key in Settings');
+    if (!canUseAI) {
+      toast.error('Please add your Gemini API key in Settings to use AI Mode.');
       setShowSettings(true);
       return;
     }
@@ -166,7 +181,7 @@ export default function App() {
       mediaRecorder.onstop = async () => {
         stream.getTracks().forEach(t => t.stop());
         const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
-        await processWithGemini(audioBlob, mimeType);
+        await processAudio(audioBlob, mimeType);
       };
 
       mediaRecorder.start(250);
@@ -179,7 +194,7 @@ export default function App() {
       setRecordingState('error');
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiKey]);
+  }, [canUseAI]);
 
   const stopAIMode = useCallback(() => {
     if (mediaRecorderRef.current?.state === 'recording') {
@@ -190,20 +205,55 @@ export default function App() {
     }
   }, []);
 
-  const processWithGemini = async (audioBlob: Blob, mimeType: string) => {
+  // ─── Process audio — server proxy first, then client-side ─────────────────────
+  const processAudio = async (audioBlob: Blob, mimeType: string) => {
+    setRecordingState('processing');
+
+    // Convert to base64
+    const arrayBuffer = await audioBlob.arrayBuffer();
+    const uint8 = new Uint8Array(arrayBuffer);
+    let binary = '';
+    const chunkSize = 8192;
+    for (let i = 0; i < uint8.length; i += chunkSize) {
+      binary += String.fromCharCode(...Array.from(uint8.subarray(i, i + chunkSize)));
+    }
+    const audioBase64 = btoa(binary);
+
     try {
-      setRecordingState('processing');
+      // Use server-side proxy (hides API key from browser)
+      const res = await fetch('/api/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          audioBase64,
+          mimeType,
+          clientKey: hasServerKey ? undefined : apiKey,
+        }),
+      });
 
-      // Convert blob to base64
-      const arrayBuffer = await audioBlob.arrayBuffer();
-      const uint8 = new Uint8Array(arrayBuffer);
-      let binary = '';
-      const chunkSize = 8192;
-      for (let i = 0; i < uint8.length; i += chunkSize) {
-        binary += String.fromCharCode(...Array.from(uint8.subarray(i, i + chunkSize)));
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Server error');
       }
-      const base64Audio = btoa(binary);
 
+      const data = await res.json() as TextResult;
+      setBanglaText(data.bangla || '');
+      setEnglishText(data.english || '');
+      setRecordingState('result');
+    } catch (serverErr: any) {
+      // Fallback: call Gemini directly from browser (requires clientKey)
+      if (apiKey) {
+        await processWithGeminiDirect(audioBase64, mimeType);
+      } else {
+        console.error(serverErr);
+        toast.error('AI processing failed. ' + serverErr.message);
+        setRecordingState('error');
+      }
+    }
+  };
+
+  const processWithGeminiDirect = async (audioBase64: string, mimeType: string) => {
+    try {
       const genAI = new GoogleGenAI({ apiKey });
       const response = await genAI.models.generateContent({
         model: 'gemini-2.0-flash',
@@ -211,14 +261,11 @@ export default function App() {
           {
             role: 'user',
             parts: [
-              { inlineData: { mimeType, data: base64Audio } },
+              { inlineData: { mimeType, data: audioBase64 } },
               {
-                text: `Transcribe this audio recording. Return ONLY a valid JSON object in this exact format:
+                text: `Transcribe this audio. Return ONLY a valid JSON object:
 {"bangla": "<Bangla/Bengali script transcription>", "english": "<English translation>"}
-Rules:
-- If the audio is in Bengali, transcribe in Bangla script and translate to English.
-- If the audio is in English, put it in both fields.
-- Return ONLY the JSON object — no markdown fences, no extra text.`,
+Return ONLY the JSON — no markdown, no extra text.`,
               },
             ],
           },
@@ -226,29 +273,19 @@ Rules:
       });
 
       const raw = (response.text || '').trim();
-      // Strip markdown code fences if Gemini wraps it
       const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-
       const match = cleaned.match(/\{[\s\S]*?"bangla"[\s\S]*?"english"[\s\S]*?\}/);
       if (match) {
         const parsed = JSON.parse(match[0]) as TextResult;
         setBanglaText(parsed.bangla || '');
         setEnglishText(parsed.english || '');
-        setRecordingState('result');
-      } else if (cleaned.startsWith('{')) {
-        const parsed = JSON.parse(cleaned) as TextResult;
-        setBanglaText(parsed.bangla || '');
-        setEnglishText(parsed.english || '');
-        setRecordingState('result');
       } else {
-        // Fallback: show raw text
         setBanglaText(raw);
         setEnglishText('');
-        setRecordingState('result');
       }
+      setRecordingState('result');
     } catch (err: any) {
-      console.error(err);
-      toast.error('AI processing failed. ' + (err.message || 'Check your API key.'));
+      toast.error('AI processing failed. Check your API key.');
       setRecordingState('error');
     }
   };
@@ -307,7 +344,7 @@ Rules:
     toast.success('Settings saved!');
   };
 
-  // ─── Derived UI state ─────────────────────────────────────────────────────────
+  // ─── Derived UI ───────────────────────────────────────────────────────────────
   const micColor =
     recordingState === 'listening' ? '#ff3d71' :
     recordingState === 'processing' ? '#ffa500' :
@@ -323,6 +360,9 @@ Rules:
       : (mode === 'live' ? 'কথা বলুন…' : 'AI দিয়ে রেকর্ড করুন');
 
   const hasText = !!(banglaText || englishText || liveInterim);
+
+  // Show settings button only when server key is NOT present
+  const showSettingsBtn = serverChecked && !hasServerKey;
 
   return (
     <div className="min-h-screen flex flex-col" style={{ background: 'linear-gradient(135deg, #080c18 0%, #0d1226 50%, #080c18 100%)' }}>
@@ -340,7 +380,7 @@ Rules:
       >
         <div className="flex items-center gap-3">
           <div
-            className="relative w-9 h-9 flex items-center justify-center rounded-xl"
+            className="w-9 h-9 flex items-center justify-center rounded-xl"
             style={{ background: 'linear-gradient(135deg, #00d4ff22, #7b2fff22)', border: '1px solid rgba(0,212,255,0.3)' }}
           >
             <Mic className="w-5 h-5" style={{ color: '#00d4ff' }} />
@@ -352,13 +392,29 @@ Rules:
             <p className="text-xs mt-0.5" style={{ color: '#99c5d0e0' }}>Your AI-powered voice writer</p>
           </div>
         </div>
-        <button
-          onClick={() => { setTempApiKey(apiKey); setShowSettings(true); }}
-          className="w-9 h-9 flex items-center justify-center rounded-xl transition-all"
-          style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}
-        >
-          <Settings className="w-4 h-4" style={{ color: '#99c5d0e0' }} />
-        </button>
+
+        {/* Settings button — only shown when no server key */}
+        {showSettingsBtn && (
+          <button
+            onClick={() => { setTempApiKey(apiKey); setShowSettings(true); }}
+            className="w-9 h-9 flex items-center justify-center rounded-xl transition-all"
+            style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}
+            title="Settings"
+          >
+            <Settings className="w-4 h-4" style={{ color: '#99c5d0e0' }} />
+          </button>
+        )}
+
+        {/* Server key indicator */}
+        {serverChecked && hasServerKey && (
+          <div
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium"
+            style={{ background: 'rgba(0,255,136,0.1)', border: '1px solid rgba(0,255,136,0.25)', color: '#00ff88' }}
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+            Ready
+          </div>
+        )}
       </header>
 
       {/* ── Main ── */}
@@ -400,12 +456,10 @@ Rules:
               animate={isRecording ? { scale: [1, 1.08, 1] } : { scale: 1 }}
               transition={{ duration: 2, repeat: Infinity }}
             />
-
             {/* Pulse ring */}
             <div className="absolute" style={{ inset: 8 }}>
               <PulseRing color={micColor} active={isRecording} />
             </div>
-
             {/* Particles during processing */}
             {recordingState === 'processing' &&
               Array.from({ length: 8 }).map((_, i) => <Particle key={i} index={i} />)}
@@ -466,13 +520,12 @@ Rules:
               exit={{ opacity: 0, y: -20 }}
               className="w-full flex flex-col gap-4"
             >
-              {/* Action row */}
               <div className="flex items-center justify-between">
                 <span className="text-xs font-medium" style={{ color: '#99c5d0e0', fontFamily: 'Noto Sans Bengali, Inter, sans-serif' }}>ফলাফল</span>
                 {hasText && (
                   <button
                     onClick={clearAll}
-                    className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs transition-all"
+                    className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs"
                     style={{ background: 'rgba(255,61,113,0.1)', color: '#ff3d71', border: '1px solid rgba(255,61,113,0.2)' }}
                   >
                     <Trash2 className="w-3 h-3" />
@@ -491,7 +544,7 @@ Rules:
                   <button
                     onClick={copyBangla}
                     disabled={!(banglaText || liveInterim).trim()}
-                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs transition-all disabled:opacity-30"
+                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs disabled:opacity-30"
                     style={
                       copiedBangla
                         ? { background: 'rgba(0,255,136,0.15)', color: '#00ff88' }
@@ -532,7 +585,7 @@ Rules:
                     <button
                       onClick={copyEnglish}
                       disabled={!englishText.trim()}
-                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs transition-all disabled:opacity-30"
+                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs disabled:opacity-30"
                       style={
                         copiedEnglish
                           ? { background: 'rgba(0,255,136,0.15)', color: '#00ff88' }
@@ -561,8 +614,8 @@ Rules:
           )}
         </AnimatePresence>
 
-        {/* No API key warning for AI mode */}
-        {mode === 'ai' && !apiKey && (
+        {/* No API key warning — only in AI mode, no server key, no client key */}
+        {mode === 'ai' && serverChecked && !canUseAI && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -588,11 +641,10 @@ Rules:
         </p>
       </main>
 
-      {/* ── Settings Modal ── */}
+      {/* ── Settings Modal (API key) ── */}
       <AnimatePresence>
         {showSettings && (
           <>
-            {/* Backdrop */}
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
@@ -601,8 +653,6 @@ Rules:
               style={{ background: 'rgba(8,12,24,0.85)', backdropFilter: 'blur(8px)' }}
               onClick={() => setShowSettings(false)}
             />
-
-            {/* Sheet */}
             <motion.div
               initial={{ opacity: 0, y: 60 }}
               animate={{ opacity: 1, y: 0 }}
@@ -611,7 +661,6 @@ Rules:
               className="fixed bottom-0 left-0 right-0 z-50 rounded-t-3xl p-6 pb-10 max-w-lg mx-auto"
               style={{ background: '#0d1226', border: '1px solid rgba(0,212,255,0.2)', borderBottom: 'none' }}
             >
-              {/* Handle */}
               <div className="w-10 h-1 rounded-full mx-auto mb-6" style={{ background: 'rgba(255,255,255,0.15)' }} />
 
               <div className="flex items-center justify-between mb-6">
@@ -628,7 +677,6 @@ Rules:
                 </button>
               </div>
 
-              {/* API Key Input */}
               <label className="flex items-center gap-2 text-xs font-semibold mb-2" style={{ color: '#00d4ff' }}>
                 <Key className="w-3.5 h-3.5" />
                 Gemini API Key
@@ -656,20 +704,15 @@ Rules:
                 </button>
               </div>
               <p className="text-xs mb-6" style={{ color: '#556680' }}>
-                Stored locally in your browser only. Get a free key at{' '}
-                <a
-                  href="https://aistudio.google.com/apikey"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  style={{ color: '#00d4ff' }}
-                >
+                Stored in your browser only. Get a free key at{' '}
+                <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer" style={{ color: '#00d4ff' }}>
                   aistudio.google.com
                 </a>
               </p>
 
               <button
                 onClick={saveSettings}
-                className="w-full flex items-center justify-center gap-2 py-3 rounded-xl font-semibold text-sm transition-all"
+                className="w-full flex items-center justify-center gap-2 py-3 rounded-xl font-semibold text-sm"
                 style={{
                   background: 'linear-gradient(135deg, rgba(0,212,255,0.2), rgba(123,47,255,0.2))',
                   border: '1px solid rgba(0,212,255,0.4)',
