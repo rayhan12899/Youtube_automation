@@ -1,28 +1,19 @@
 {
-  "name": "YouTube AI Creator Studio",
-  "short_name": "YT AI Studio",
-  "description": "Next-Gen AI Creator Studio for YouTube. Generate viral video ideas, scripts, thumbnails, and more.",
+  "name": "Smart Voice Writer",
+  "short_name": "Voice Writer",
+  "description": "AI-powered voice writer that converts speech to Bangla and English text using Gemini AI.",
   "start_url": "/",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#06070a",
-  "theme_color": "#f27d26",
-  "categories": ["productivity", "social", "utilities"],
+  "background_color": "#080c18",
+  "theme_color": "#00d4ff",
+  "categories": ["productivity", "utilities"],
   "icons": [
     {
       "src": "icon.svg",
       "sizes": "192x192 512x512",
       "type": "image/svg+xml",
       "purpose": "any maskable"
-    }
-  ],
-  "screenshots": [
-    {
-      "src": "icon.svg",
-      "sizes": "512x512",
-      "type": "image/svg+xml",
-      "form_factor": "wide",
-      "label": "AI Creator Studio Dashboard"
     }
   ]
 }
